@@ -1,0 +1,213 @@
+' Read-only Linux /proc inspection. All returned text and records are owned.
+Public Class ProcessInspectionLinuxProcessInfo
+    Public Property ProcessId As Integer
+    Public Property Name As String
+    Public Property State As String
+    Public Property ParentProcessId As Integer
+    Public Property ThreadCount As Integer
+    Public Property StartTimeTicks As Integer
+    Public Property ExecutablePath As Optional Of String
+    Public Property ExecutableError As Integer
+    Public Property UserTicks As Integer
+    Public Property KernelTicks As Integer
+    Public Property ResidentPages As Integer
+End Class
+
+Public Function ProcessInspectionLinuxIsSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+Private Sub ProcessInspectionLinuxRequireLinux()
+#If Not TargetLinux Then
+    Throw New UnsupportedOperationException("linuxprocess requires Linux")
+#End If
+End Sub
+
+Private Function ProcessInspectionLinuxDecimalValue(text As String) As Integer
+    If text = "" Then
+        Throw New InvalidArgumentException("Expected a nonnegative decimal integer")
+    End If
+    Dim value As Integer = 0
+    For i As Integer = 1 To String.Len(text)
+        Dim digit As Integer = String.Asc(text, i) - 48
+        If digit < 0 Or digit > 9 Then
+            Throw New InvalidArgumentException("Expected a nonnegative decimal integer")
+        End If
+        If value > (9223372036854775807 - digit) \ 10 Then
+            Throw New InvalidArgumentException("Decimal integer overflow")
+        End If
+        value = value * 10 + digit
+    Next
+    Return value
+End Function
+
+''' Parse through stat field 22; comm may contain spaces, parentheses and newlines.
+Public Function ProcessInspectionLinuxParseStat(text As String) As ProcessInspectionLinuxProcessInfo
+    ProcessInspectionLinuxRequireLinux()
+    Dim opening As Integer = String.IndexOf(text, "(")
+    Dim closing As Integer = String.LastIndexOf(text, ")")
+    If opening < 2 Or closing < opening Or String.Mid(text, opening, 1) <> " " Then
+        Throw New InvalidArgumentException("Malformed /proc stat record")
+    End If
+    Dim tail As String = String.Trim(String.Substring(text, closing + 1))
+    tail = String.Replace(String.Replace(tail, "\t", " "), "\n", " ")
+    Dim tokens As Array Of String = []
+    For Each token As String In String.Split(tail, " ")
+        If token <> "" Then
+            Array.Append(tokens, token)
+        End If
+    Next
+    If Array.Count(tokens) < 22 Or String.Len(tokens(0)) <> 1 Then
+        Throw New InvalidArgumentException("Incomplete /proc stat record")
+    End If
+    Dim info As New ProcessInspectionLinuxProcessInfo
+    info.ProcessId = ProcessInspectionLinuxDecimalValue(String.Trim(String.Left(text, opening)))
+    If info.ProcessId < 1 Or info.ProcessId > 2147483647 Then
+        Throw New InvalidArgumentException("Invalid process ID in stat record")
+    End If
+    info.Name = String.Substring(text, opening + 1, closing - opening - 1)
+    info.State = tokens(0)
+    info.ParentProcessId = ProcessInspectionLinuxDecimalValue(tokens(1))
+    info.ThreadCount = ProcessInspectionLinuxDecimalValue(tokens(17))
+    info.StartTimeTicks = ProcessInspectionLinuxDecimalValue(tokens(19))
+    info.UserTicks = ProcessInspectionLinuxDecimalValue(tokens(11))
+    info.KernelTicks = ProcessInspectionLinuxDecimalValue(tokens(12))
+    info.ResidentPages = ProcessInspectionLinuxDecimalValue(tokens(21))
+    Return info
+End Function
+
+#If TargetLinux Then
+Private Optional Declare Function ProcessInspectionLinuxCOpen Lib "c" Alias "fopen" (procPath As CString, mode As CString) As Ptr
+Private Optional Declare Function ProcessInspectionLinuxCRead Lib "c" Alias "fread" (buffer As Ptr, size As UInt64, count As UInt64, stream As Ptr) As UInt64
+Private Optional Declare Function ProcessInspectionLinuxCError Lib "c" Alias "ferror" (stream As Ptr) As Int32
+Private Optional Declare Function ProcessInspectionLinuxCClose Lib "c" Alias "fclose" (stream As Ptr) As Int32
+Private Optional Declare Function ProcessInspectionLinuxCAllocate Lib "c" Alias "calloc" (count As UInt64, size As UInt64) As Ptr
+Private Optional Declare Sub ProcessInspectionLinuxCFree Lib "c" Alias "free" (buffer As Ptr)
+Private Optional Declare Function ProcessInspectionLinuxCReadLink Lib "c" Alias "readlink" (procPath As CString, buffer As Ptr, capacity As UInt64) As Int64
+Private Optional Declare Function ProcessInspectionLinuxCOpenDirectory Lib "c" Alias "opendir" (procPath As CString) As Ptr
+Private Optional Declare Function ProcessInspectionLinuxCReadDirectory Lib "c" Alias "readdir" (directory As Ptr) As Ptr
+Private Optional Declare Function ProcessInspectionLinuxCCloseDirectory Lib "c" Alias "closedir" (directory As Ptr) As Int32
+Private Optional Declare Function ProcessInspectionLinuxCErrnoAddress Lib "c" Alias "__errno_location" () As Ptr
+Private Optional Declare Function ProcessInspectionLinuxCCopyOut Lib "c" Alias "memcpy" (ByRef value As Int32, source As Ptr, size As UInt64) As Ptr
+Private Optional Declare Function ProcessInspectionLinuxCCopyIn Lib "c" Alias "memcpy" (destination As Ptr, ByRef value As Int32, size As UInt64) As Ptr
+
+Private Function ProcessInspectionLinuxNativeError() As Integer
+    Dim code As Int32 = 0
+    ProcessInspectionLinuxCCopyOut(code, ProcessInspectionLinuxCErrnoAddress(), 4)
+    Return code
+End Function
+
+Private Sub ProcessInspectionLinuxClearError()
+    Dim code As Int32 = 0
+    ProcessInspectionLinuxCCopyIn(ProcessInspectionLinuxCErrnoAddress(), code, 4)
+End Sub
+
+Private Sub ProcessInspectionLinuxFail(operation As String)
+    Dim code As Integer = ProcessInspectionLinuxNativeError()
+    Throw New RuntimeException(operation + " failed (errno " + Str(code) + ")", code)
+End Sub
+
+Private Function ProcessInspectionLinuxReadStatFile(procPath As String) As String
+    Dim stream As Ptr = ProcessInspectionLinuxCOpen(CType(procPath, CString), CType("rb", CString))
+    If stream = Nil Then
+        ProcessInspectionLinuxFail("fopen " + procPath)
+    End If
+    Try
+        Dim buffer As Ptr = ProcessInspectionLinuxCAllocate(65537, 1)
+        If buffer = Nil Then
+            Throw New RuntimeException("Unable to allocate stat buffer")
+        End If
+        Try
+            Dim count As UInt64 = ProcessInspectionLinuxCRead(buffer, 1, 65536, stream)
+            If ProcessInspectionLinuxCError(stream) <> 0 Then
+                ProcessInspectionLinuxFail("fread " + procPath)
+            End If
+            If count = 65536 Then
+                Throw New RuntimeException("/proc stat record exceeded 65535 bytes")
+            End If
+            Return CType(CType(buffer, CString), String)
+        Finally
+            ProcessInspectionLinuxCFree(buffer)
+        End Try
+    Finally
+        ProcessInspectionLinuxCClose(stream)
+    End Try
+End Function
+#End If
+
+''' Unsorted PID snapshot from this mount/PID namespace; entries can disappear immediately.
+Public Function ProcessInspectionLinuxProcessIds() As Array Of Integer
+    ProcessInspectionLinuxRequireLinux()
+    Dim ids As Array Of Integer = []
+#If TargetLinux Then
+    Dim directory As Ptr = ProcessInspectionLinuxCOpenDirectory(CType("/proc", CString))
+    If directory = Nil Then
+        ProcessInspectionLinuxFail("opendir /proc")
+    End If
+    Try
+        While True
+            ProcessInspectionLinuxClearError()
+            Dim entry As Ptr = ProcessInspectionLinuxCReadDirectory(directory)
+            If entry = Nil Then
+                If ProcessInspectionLinuxNativeError() <> 0 Then
+                    ProcessInspectionLinuxFail("readdir /proc")
+                End If
+                Exit While
+            End If
+            ' glibc 64-bit Linux struct dirent: d_name follows 8+8+2+1 bytes.
+            Dim nameAddress As Ptr = CType(CType(entry, Integer) + 19, Ptr)
+            Dim name As String = CType(CType(nameAddress, CString), String)
+            If name <> "" Then
+                Dim first As Integer = String.Asc(name)
+                If first >= 48 And first <= 57 Then
+                    Dim pid As Integer = ProcessInspectionLinuxDecimalValue(name)
+                    If pid > 0 And pid <= 2147483647 Then
+                        Array.Append(ids, pid)
+                    End If
+                End If
+            End If
+        End While
+    Finally
+        ProcessInspectionLinuxCCloseDirectory(directory)
+    End Try
+#End If
+    Return ids
+End Function
+
+''' Read stat then exe. ExecutableError preserves readlink errno without losing stat data.
+Public Function ProcessInspectionLinuxReadProcess(pid As Integer) As ProcessInspectionLinuxProcessInfo
+    ProcessInspectionLinuxRequireLinux()
+    If pid < 1 Or pid > 2147483647 Then
+        Throw New InvalidArgumentException("PID must be between 1 and 2147483647")
+    End If
+#If TargetLinux Then
+    Dim basePath As String = "/proc/" + Str(pid)
+    Dim info As ProcessInspectionLinuxProcessInfo = ProcessInspectionLinuxParseStat(ProcessInspectionLinuxReadStatFile(basePath + "/stat"))
+    If info.ProcessId <> pid Then
+        Throw New RuntimeException("/proc stat PID did not match request")
+    End If
+    Dim buffer As Ptr = ProcessInspectionLinuxCAllocate(65537, 1)
+    If buffer = Nil Then
+        Throw New RuntimeException("Unable to allocate executable path buffer")
+    End If
+    Try
+        Dim count As Int64 = ProcessInspectionLinuxCReadLink(CType(basePath + "/exe", CString), buffer, 65536)
+        If count < 0 Then
+            info.ExecutableError = ProcessInspectionLinuxNativeError()
+        ElseIf count = 65536 Then
+            Throw New RuntimeException("Executable path exceeded 65535 bytes")
+        Else
+            info.ExecutablePath = Some(CType(CType(buffer, CString), String))
+        End If
+    Finally
+        ProcessInspectionLinuxCFree(buffer)
+    End Try
+    Return info
+#Else
+    Return Nil
+#End If
+End Function

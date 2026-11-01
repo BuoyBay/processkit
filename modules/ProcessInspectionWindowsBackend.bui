@@ -1,0 +1,123 @@
+' Current-process diagnostics for 64-bit Windows. No handles escape the module.
+Sequential Structure ProcessInspectionWindowsProcessMemory
+    Size As UInt32
+    PageFaultCount As UInt32
+    PeakWorkingSetBytes As UInt64
+    WorkingSetBytes As UInt64
+    PeakPagedPoolBytes As UInt64
+    PagedPoolBytes As UInt64
+    PeakNonPagedPoolBytes As UInt64
+    NonPagedPoolBytes As UInt64
+    CommitBytes As UInt64
+    PeakCommitBytes As UInt64
+    PrivateCommitBytes As UInt64
+End Structure
+
+Sequential Structure ProcessInspectionWindowsProcessIO
+    ReadOperations As UInt64
+    WriteOperations As UInt64
+    OtherOperations As UInt64
+    ReadBytes As UInt64
+    WriteBytes As UInt64
+    OtherBytes As UInt64
+End Structure
+
+Sequential Structure ProcessInspectionWindowsNativeFileTime
+    Low As UInt32
+    High As UInt32
+End Structure
+
+Public Class ProcessInspectionWindowsProcessSnapshot
+    Public Property CreationFileTime As UInt64
+    Public Property KernelSeconds As Double
+    Public Property UserSeconds As Double
+    Public Property HandleCount As Integer
+    Public Property Memory As ProcessInspectionWindowsProcessMemory
+    Public Property IO As ProcessInspectionWindowsProcessIO
+End Class
+
+#If TargetWindows Then
+Private Optional Declare Function ProcessInspectionWindowsCurrentProcess Lib "kernel32" Alias "GetCurrentProcess" () As Ptr
+Private Optional Declare Function ProcessInspectionWindowsProcessTimes Lib "kernel32" Alias "GetProcessTimes" (process As Ptr, ByRef created As ProcessInspectionWindowsNativeFileTime, ByRef exited As ProcessInspectionWindowsNativeFileTime, ByRef kernel As ProcessInspectionWindowsNativeFileTime, ByRef user As ProcessInspectionWindowsNativeFileTime) As Int32
+Private Optional Declare Function ProcessInspectionWindowsProcessHandles Lib "kernel32" Alias "GetProcessHandleCount" (process As Ptr, ByRef count As UInt32) As Int32
+Private Optional Declare Function ProcessInspectionWindowsProcessMemoryInfo Lib "kernel32" Alias "K32GetProcessMemoryInfo" (process As Ptr, ByRef memory As ProcessInspectionWindowsProcessMemory, size As UInt32) As Int32
+Private Optional Declare Function ProcessInspectionWindowsProcessIOInfo Lib "kernel32" Alias "GetProcessIoCounters" (process As Ptr, ByRef counters As ProcessInspectionWindowsProcessIO) As Int32
+' Import eagerly: lazy symbol resolution can overwrite the failure being read.
+Private Declare Function ProcessInspectionWindowsLastError Lib "kernel32" Alias "GetLastError" () As UInt32
+
+Private Sub ProcessInspectionWindowsFail(operation As String)
+    Dim code As Integer = ProcessInspectionWindowsLastError()
+    Throw New RuntimeException(operation + " failed (Win32 error " + Str(code) + ")", code)
+End Sub
+
+Private Function ProcessInspectionWindowsFileTimeValue(value As ProcessInspectionWindowsNativeFileTime) As UInt64
+    Dim high As UInt64 = value.High
+    Return high * 4294967296 + value.Low
+End Function
+#End If
+
+Public Function ProcessInspectionWindowsIsSupported() As Boolean
+#If TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+''' Sample CPU, memory, handles and IO for this process; fields are not atomic together.
+Public Function ProcessInspectionWindowsReadCurrentProcess() As ProcessInspectionWindowsProcessSnapshot
+#If TargetWindows Then
+    Dim process As Ptr = ProcessInspectionWindowsCurrentProcess()
+    Dim created As ProcessInspectionWindowsNativeFileTime
+    Dim exited As ProcessInspectionWindowsNativeFileTime
+    Dim kernel As ProcessInspectionWindowsNativeFileTime
+    Dim user As ProcessInspectionWindowsNativeFileTime
+    If ProcessInspectionWindowsProcessTimes(process, created, exited, kernel, user) = 0 Then
+        ProcessInspectionWindowsFail("GetProcessTimes")
+    End If
+    Dim handles As UInt32 = 0
+    If ProcessInspectionWindowsProcessHandles(process, handles) = 0 Then
+        ProcessInspectionWindowsFail("GetProcessHandleCount")
+    End If
+    Dim memory As ProcessInspectionWindowsProcessMemory
+    memory.Size = 80
+    If ProcessInspectionWindowsProcessMemoryInfo(process, memory, 80) = 0 Then
+        ProcessInspectionWindowsFail("K32GetProcessMemoryInfo")
+    End If
+    Dim counters As ProcessInspectionWindowsProcessIO
+    If ProcessInspectionWindowsProcessIOInfo(process, counters) = 0 Then
+        ProcessInspectionWindowsFail("GetProcessIoCounters")
+    End If
+    Dim snapshot As New ProcessInspectionWindowsProcessSnapshot
+    snapshot.CreationFileTime = ProcessInspectionWindowsFileTimeValue(created)
+    Dim kernelTicks As Double = ProcessInspectionWindowsFileTimeValue(kernel)
+    Dim userTicks As Double = ProcessInspectionWindowsFileTimeValue(user)
+    snapshot.KernelSeconds = kernelTicks / 10000000.0
+    snapshot.UserSeconds = userTicks / 10000000.0
+    snapshot.HandleCount = handles
+    snapshot.Memory = memory
+    snapshot.IO = counters
+    ' GetCurrentProcess is a pseudo-handle; it must not be closed.
+    Return snapshot
+#Else
+    Throw New UnsupportedOperationException("WinProcess requires Windows")
+#End If
+End Function
+
+#If TargetWindows Then
+Public Function ProcessInspectionWindowsCreationTime(process As Ptr) As Optional Of DateTime
+    Dim created As ProcessInspectionWindowsNativeFileTime
+    Dim exited As ProcessInspectionWindowsNativeFileTime
+    Dim kernel As ProcessInspectionWindowsNativeFileTime
+    Dim user As ProcessInspectionWindowsNativeFileTime
+    If ProcessInspectionWindowsProcessTimes(process, created, exited, kernel, user) = 0 Then
+        Dim code As Integer = ProcessInspectionWindowsLastError()
+        If code = 5 Or code = 6 Or code = 87 Then Return None
+        Throw New RuntimeException("GetProcessTimes for inspection failed", code)
+    End If
+    Dim native As UInt64 = ProcessInspectionWindowsFileTimeValue(created)
+    If native < 116444736000000000 Or native > 9223372036854775807 Then Return None
+    Dim millis As Integer = (native - 116444736000000000) \ 10000
+    Return Some(DateTime.FromUnixMillis(millis, TimeZone.Utc))
+End Function
+#End If

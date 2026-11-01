@@ -1,0 +1,24 @@
+Import processkit
+
+' Supply an absolute executable path followed by its arguments.
+Sub Main(args As Array Of String)
+    If Array.Count(args) < 2 Then Throw New InvalidArgumentException("Pass an executable path")
+    Dim arguments(0) As String
+    For i As Integer = 2 To Array.Count(args) - 1
+        Array.Append(arguments, args(i))
+    Next
+    Dim process As New PipeProcess(args(1), arguments)
+    process.CloseInput()
+    Dim outputBytes As New Bytes()
+    Dim errorBytes As New Bytes()
+    While True
+        outputBytes.Append(process.ReadOutput())
+        errorBytes.Append(process.ReadError())
+        Dim running As Boolean = process.Poll()
+        If Not running And process.OutputClosed And process.ErrorClosed Then Exit While
+        Thread.Sleep(1)
+    End While
+    Print "stdout: " + outputBytes.ToString(Text.Encodings.UTF8)
+    Print "stderr: " + errorBytes.ToString(Text.Encodings.UTF8)
+    Print "exit: " + String.From(process.ExitCode)
+End Sub

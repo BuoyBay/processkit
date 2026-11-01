@@ -1,0 +1,280 @@
+Public Class RunningProcessInfo
+    Private Property mProcessId As Integer
+    Public Property ProcessId As Integer
+        Get
+            Return mProcessId
+        End Get
+    End Property
+    Private Property mParentProcessId As Optional Of Integer
+    Public Property ParentProcessId As Optional Of Integer
+        Get
+            Return mParentProcessId
+        End Get
+    End Property
+    Private Property mName As String
+    Public Property Name As String
+        Get
+            Return mName
+        End Get
+    End Property
+    Private Property mExecutablePath As Optional Of String
+    Public Property ExecutablePath As Optional Of String
+        Get
+            Return mExecutablePath
+        End Get
+    End Property
+    Private Property mThreadCount As Optional Of Integer
+    Public Property ThreadCount As Optional Of Integer
+        Get
+            Return mThreadCount
+        End Get
+    End Property
+    Private Property mStartTime As Optional Of DateTime
+    Public Property StartTime As Optional Of DateTime
+        Get
+            Return mStartTime
+        End Get
+    End Property
+    Public Sub Constructor(pProcessId As Integer, pParentProcessId As Optional Of Integer, pName As String, pExecutablePath As Optional Of String, pThreadCount As Optional Of Integer, pStartTime As Optional Of DateTime)
+        mProcessId = pProcessId
+        mParentProcessId = pParentProcessId
+        mName = pName
+        mExecutablePath = pExecutablePath
+        mThreadCount = pThreadCount
+        mStartTime = pStartTime
+    End Sub
+End Class
+
+Public Class ProcessUsageSnapshot
+    Private Property mKernelSeconds As Double
+    Public Property KernelSeconds As Double
+        Get
+            Return mKernelSeconds
+        End Get
+    End Property
+    Private Property mUserSeconds As Double
+    Public Property UserSeconds As Double
+        Get
+            Return mUserSeconds
+        End Get
+    End Property
+    Private Property mResidentBytes As Optional Of Integer
+    Public Property ResidentBytes As Optional Of Integer
+        Get
+            Return mResidentBytes
+        End Get
+    End Property
+    Private Property mHandleCount As Optional Of Integer
+    Public Property HandleCount As Optional Of Integer
+        Get
+            Return mHandleCount
+        End Get
+    End Property
+    Public Sub Constructor(pKernelSeconds As Double, pUserSeconds As Double, pResidentBytes As Optional Of Integer, pHandleCount As Optional Of Integer)
+        mKernelSeconds = pKernelSeconds
+        mUserSeconds = pUserSeconds
+        mResidentBytes = pResidentBytes
+        mHandleCount = pHandleCount
+    End Sub
+End Class
+#If TargetLinux Then
+Import ProcessInspectionLinuxBackend
+Private Optional Declare Function InspectionGetPid Lib "c" Alias "getpid" () As Int32
+Private Optional Declare Function InspectionSysconf Lib "c" Alias "sysconf" (name As Int32) As Int64
+#ElseIf TargetWindows Then
+Import ProcessInspectionWindowsBackend
+Private Optional Declare Function InspectionGetPid Lib "kernel32" Alias "GetCurrentProcessId" () As UInt32
+Private Optional Declare Function InspectionSnapshot Lib "kernel32" Alias "CreateToolhelp32Snapshot" (nativeOptions As UInt32, processId As UInt32) As Ptr
+Private Optional Declare Function InspectionFirst Lib "kernel32" Alias "Process32FirstW" (snapshot As Ptr, entry As Ptr) As Int32
+Private Optional Declare Function InspectionNext Lib "kernel32" Alias "Process32NextW" (snapshot As Ptr, entry As Ptr) As Int32
+Private Declare Function InspectionLastError Lib "kernel32" Alias "GetLastError" () As UInt32
+Private Optional Declare Function InspectionClose Lib "kernel32" Alias "CloseHandle" (handle As Ptr) As Int32
+Private Optional Declare Function InspectionOpenProcess Lib "kernel32" Alias "OpenProcess" (access As UInt32, inherit As Int32, processId As UInt32) As Ptr
+Private Optional Declare Function InspectionImageName Lib "kernel32" Alias "QueryFullProcessImageNameW" (process As Ptr, nativeOptions As UInt32, buffer As Ptr, ByRef size As UInt32) As Int32
+#ElseIf TargetMac Then
+Private Declare Function InspectionGetPid Lib "c" Alias "getpid" () As Int32
+#End If
+
+''' Read-only inspection is implemented for Linux/glibc and Windows x64/ARM64.
+Public Function ProcessInspectionSupported() As Boolean
+#If TargetLinux Then
+    Return True
+#ElseIf TargetWindows Then
+    Return True
+#Else
+    Return False
+#End If
+End Function
+
+Public Function CurrentProcessId() As Integer
+#If TargetLinux Then
+    Return InspectionGetPid()
+#ElseIf TargetWindows Then
+    Return InspectionGetPid()
+#ElseIf TargetMac Then
+    Return InspectionGetPid()
+#Else
+    Throw New UnsupportedOperationException("Process ID is unsupported on this target")
+#End If
+End Function
+
+#If TargetWindows Then
+Private Function InspectionBuffer(size As Integer) As Bytes
+    Dim storage As New Bytes(size)
+    For i As Integer = 1 To size
+        storage.Append(0)
+    Next
+    Return storage
+End Function
+
+Private Function InspectionUInt32(storage As Bytes, offset As Integer) As Integer
+    Return storage.Item(offset) + storage.Item(offset + 1) * 256 + storage.Item(offset + 2) * 65536 + storage.Item(offset + 3) * 16777216
+End Function
+
+Private Function InspectionEntryName(storage As Bytes) As String
+    For count As Integer = 0 To 259
+        If storage.Item(44 + count * 2) = 0 And storage.Item(45 + count * 2) = 0 Then
+            Dim wideBytes As New Bytes(count * 2)
+            wideBytes.Append(CType(CType(storage.DataPtr(), Integer) + 44, Ptr), count * 2)
+            Return String.FromUTF16LE(wideBytes)
+        End If
+    Next
+    Throw New RuntimeException("Process32 returned an unterminated executable name")
+End Function
+
+Private Function InspectionWindowsEntries() As Array Of RunningProcessInfo
+    Dim snapshot As Ptr = InspectionSnapshot(2, 0)
+    If snapshot = CType(-1, Ptr) Then
+        Dim code As Integer = InspectionLastError()
+        Throw New RuntimeException("CreateToolhelp32Snapshot failed", code)
+    End If
+    Dim results As Array Of RunningProcessInfo = []
+    Try
+        ' PROCESSENTRY32W: Windows LP64 x64/ARM64, sizeof = 568; name offset 44.
+        Dim storage As Bytes = InspectionBuffer(568)
+        storage.SetItem(0, 56)
+        storage.SetItem(1, 2)
+        Dim success As Integer = InspectionFirst(snapshot, storage.DataPtr())
+        While success <> 0
+            Dim id As Integer = InspectionUInt32(storage, 8)
+            If id > 0 Then
+                Array.Append(results, New RunningProcessInfo(id, Some(InspectionUInt32(storage, 32)), InspectionEntryName(storage), None, Some(InspectionUInt32(storage, 28)), None))
+            End If
+            success = InspectionNext(snapshot, storage.DataPtr())
+        End While
+        Dim code As Integer = InspectionLastError()
+        If code <> 18 Then
+            Throw New RuntimeException("Process32 enumeration failed", code)
+        End If
+    Finally
+        InspectionClose(snapshot)
+    End Try
+    Return results
+End Function
+#End If
+
+''' Owned PID snapshot. PIDs can exit or be reused immediately; this grants no ownership.
+Public Function RunningProcessIds() As Array Of Integer
+#If TargetLinux Then
+    Return ProcessInspectionLinuxProcessIds()
+#ElseIf TargetWindows Then
+    Dim results As Array Of Integer = []
+    For Each item In InspectionWindowsEntries()
+        Array.Append(results, item.ProcessId)
+    Next
+    Return results
+#Else
+    Throw New UnsupportedOperationException("Process enumeration is unsupported on this target")
+#End If
+End Function
+
+''' None means absent/exited; denied optional fields stay None. Snapshots are not atomic.
+Public Function ReadRunningProcess(processId As Integer) As Optional Of RunningProcessInfo
+    If processId < 1 Or processId > 4294967295 Then
+        Throw New InvalidArgumentException("Process ID must be within 1..4294967295")
+    End If
+#If TargetLinux Then
+    If processId > 2147483647 Then
+        Throw New InvalidArgumentException("Linux process IDs must fit a positive Int32")
+    End If
+    Dim item As ProcessInspectionLinuxProcessInfo
+    Dim failure As Exception
+    Try
+        item = ProcessInspectionLinuxReadProcess(processId)
+    Catch e As RuntimeException
+        failure = e
+    End Try
+    ' Do not rethrow inside Catch: upstream BUI-015 can skip Finally on rethrow.
+    If failure <> Nil Then
+        If failure.ErrorCode = 2 Or failure.ErrorCode = 3 Then
+            Return None
+        End If
+        Throw failure
+    End If
+    Return Some(New RunningProcessInfo(item.ProcessId, Some(item.ParentProcessId), item.Name, item.ExecutablePath, Some(item.ThreadCount), None))
+#ElseIf TargetWindows Then
+    For Each item In InspectionWindowsEntries()
+        If item.ProcessId = processId Then
+            Dim process As Ptr = InspectionOpenProcess(4096, 0, processId)
+            If process = Nil Then
+                Dim code As Integer = InspectionLastError()
+                If code = 87 Then Return None
+                If code = 5 Then Return Some(item)
+                Throw New RuntimeException("OpenProcess for inspection failed", code)
+            End If
+            Dim executable As Optional Of String
+            Dim created As Optional Of DateTime
+            Try
+                Dim storage As Bytes = InspectionBuffer(65536)
+                Dim count As UInt32 = 32768
+                If InspectionImageName(process, 0, storage.DataPtr(), count) <> 0 Then
+                    If count > 32767 Then Throw New RuntimeException("QueryFullProcessImageNameW returned an invalid size")
+                    Dim wideBytes As New Bytes(count * 2)
+                    wideBytes.Append(storage.DataPtr(), count * 2)
+                    executable = Some(String.FromUTF16LE(wideBytes))
+                Else
+                    Dim code As Integer = InspectionLastError()
+                    If code <> 5 And code <> 6 And code <> 87 Then
+                        Throw New RuntimeException("QueryFullProcessImageNameW failed", code)
+                    End If
+                End If
+                created = ProcessInspectionWindowsCreationTime(process)
+            Finally
+                InspectionClose(process)
+            End Try
+            Return Some(New RunningProcessInfo(item.ProcessId, item.ParentProcessId, item.Name, executable, item.ThreadCount, created))
+        End If
+    Next
+    Return None
+#Else
+    Throw New UnsupportedOperationException("Process inspection is unsupported on this target")
+#End If
+End Function
+
+''' CPU seconds and current resident bytes, not peak RSS. Fields are sampled separately.
+Public Function ReadCurrentProcessUsage() As ProcessUsageSnapshot
+#If TargetLinux Then
+    Dim item As ProcessInspectionLinuxProcessInfo = ProcessInspectionLinuxReadProcess(CurrentProcessId())
+    Dim ticksPerSecond As Integer = InspectionSysconf(2)
+    Dim pageSize As Integer = InspectionSysconf(30)
+    If ticksPerSecond < 1 Or pageSize < 1 Then
+        Throw New RuntimeException("sysconf returned invalid clock/page units")
+    End If
+    If item.ResidentPages > 9223372036854775807 \ pageSize Then
+        Throw New RuntimeException("Resident byte count exceeds Integer")
+    End If
+    Dim kernel As Double = item.KernelTicks
+    Dim user As Double = item.UserTicks
+    Dim frequency As Double = ticksPerSecond
+    Return New ProcessUsageSnapshot(kernel / frequency, user / frequency, Some(item.ResidentPages * pageSize), None)
+#ElseIf TargetWindows Then
+    Dim item As ProcessInspectionWindowsProcessSnapshot = ProcessInspectionWindowsReadCurrentProcess()
+    If item.Memory.WorkingSetBytes > 9223372036854775807 Then
+        Throw New RuntimeException("Resident byte count exceeds Integer")
+    End If
+    Dim resident As Integer = item.Memory.WorkingSetBytes
+    Return New ProcessUsageSnapshot(item.KernelSeconds, item.UserSeconds, Some(resident), Some(item.HandleCount))
+#Else
+    Throw New UnsupportedOperationException("Process usage is unsupported on this target")
+#End If
+End Function

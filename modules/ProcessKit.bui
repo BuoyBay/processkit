@@ -1,0 +1,198 @@
+Public Import ProcessInspection
+Public Import ProcessInspection.{ CurrentProcessId, RunningProcessIds, ReadRunningProcess, ReadCurrentProcessUsage, ProcessInspectionSupported }
+
+Private Declare Function N_new Lib "buoy_processkit" Alias "bpk_new" (executablePath As String, workingDirectory As String) As Ptr
+Private Declare Function N_arg Lib "buoy_processkit" Alias "bpk_arg" (handle As Ptr, argument As String) As Integer
+Private Declare Function N_env Lib "buoy_processkit" Alias "bpk_env" (handle As Ptr, name As String, value As String) As Integer
+Private Declare Function N_start Lib "buoy_processkit" Alias "bpk_start" (handle As Ptr) As Integer
+Private Declare Function N_own_tree Lib "buoy_processkit" Alias "bpk_own_tree" (handle As Ptr) As Integer
+Private Declare Function N_terminate_tree Lib "buoy_processkit" Alias "bpk_terminate_tree" (handle As Ptr) As Integer
+Private Declare Function N_signal Lib "buoy_processkit" Alias "bpk_signal" (handle As Ptr) As Integer
+Private Declare Function N_error Lib "buoy_processkit" Alias "bpk_error" (handle As Ptr) As String
+Private Declare Function N_poll Lib "buoy_processkit" Alias "bpk_poll" (handle As Ptr) As Integer
+Private Declare Function N_exit Lib "buoy_processkit" Alias "bpk_exit" (handle As Ptr) As Integer
+Private Declare Function N_eof Lib "buoy_processkit" Alias "bpk_eof" (handle As Ptr, streamIndex As Integer) As Integer
+Private Declare Function N_read Lib "buoy_processkit" Alias "bpk_read" (handle As Ptr, streamIndex As Integer, buffer As Ptr, capacity As Integer) As Integer
+Private Declare Function N_write Lib "buoy_processkit" Alias "bpk_write" (handle As Ptr, buffer As Ptr, length As Integer, offset As Integer) As Integer
+Private Declare Sub N_close_input Lib "buoy_processkit" Alias "bpk_close_input" (handle As Ptr)
+Private Declare Function N_terminate Lib "buoy_processkit" Alias "bpk_terminate" (handle As Ptr) As Integer
+Private Declare Sub N_delete Lib "buoy_processkit" Alias "bpk_delete" (handle As Ptr)
+Private Declare Function N_alloc Lib "buoy_processkit" Alias "bpk_alloc" (size As Integer) As Ptr
+Private Declare Sub N_free Lib "buoy_processkit" Alias "bpk_free" (buffer As Ptr)
+
+Public Class ProcessException Inherits Exception
+    Public Sub Constructor(message As String)
+        Super.Constructor(message, 0)
+    End Sub
+End Class
+
+Private Sub ValidateNativeText(value As String)
+    Dim encoded As Bytes = Bytes.FromString(value, Text.Encodings.UTF8)
+    For i As Integer = 0 To encoded.Count - 1
+        If encoded.Item(i) = 0 Then Throw New InvalidArgumentException("Embedded NUL in process arguments")
+    Next
+End Sub
+
+''' Shell-free executable with separate stdin, stdout, and stderr pipes. Confine to one thread.
+Public Class PipeProcess
+    Private Property Handle As Ptr
+
+    Public Sub Constructor(executablePath As String, arguments As Array Of String, workingDirectory As String = "", ownTree As Boolean = False)
+        Me.StartProcess(executablePath, arguments, workingDirectory, Nil, ownTree)
+    End Sub
+
+    ''' Inherit the parent's environment and override only these names for this child.
+    Public Sub Constructor(executablePath As String, arguments As Array Of String, workingDirectory As String, environmentOverrides As Map Of String, String, ownTree As Boolean = False)
+        If environmentOverrides = Nil Then Throw New InvalidArgumentException("Environment overrides map is required")
+        Me.StartProcess(executablePath, arguments, workingDirectory, environmentOverrides, ownTree)
+    End Sub
+
+    Private Sub StartProcess(executablePath As String, arguments As Array Of String, workingDirectory As String, environmentOverrides As Map Of String, String, ownTree As Boolean)
+        ValidateNativeText(executablePath)
+        ValidateNativeText(workingDirectory)
+        If executablePath = "" Then Throw New InvalidArgumentException("Executable path is required")
+        For Each argument As String In arguments
+            ValidateNativeText(argument)
+        Next
+        If environmentOverrides <> Nil Then
+            For Each entry In environmentOverrides.Entries()
+                ValidateNativeText(entry.Key)
+                ValidateNativeText(entry.Value)
+                If entry.Key = "" Or String.IndexOf(entry.Key, "=") >= 0 Then Throw New InvalidArgumentException("Environment names must be nonempty and contain no equals sign")
+            Next
+        End If
+        Me.Handle = N_new(executablePath, workingDirectory)
+        If Me.Handle = Nil Then Throw New ProcessException("Cannot allocate process")
+        If ownTree Then
+            If N_own_tree(Me.Handle) = 0 Then Me.FailNative()
+        End If
+        For Each argument As String In arguments
+            If N_arg(Me.Handle, argument) = 0 Then Me.FailNative()
+        Next
+        ' Strip inherited Studio credentials; explicit child overrides remain authoritative.
+        For Each secretName As String In ["XAI_API_KEY", "META_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "BUOY_STUDIO_GROK_TOKEN", "BUOY_STUDIO_MUSE_TOKEN", "CHATGPT_ACCESS_TOKEN", "OPENAI_ACCESS_TOKEN", "ACCESS_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"]
+            If N_env(Me.Handle, secretName, "") = 0 Then Me.FailNative()
+        Next
+        If environmentOverrides <> Nil Then
+            For Each entry In environmentOverrides.Entries()
+                If N_env(Me.Handle, entry.Key, entry.Value) = 0 Then Me.FailNative()
+            Next
+        End If
+        If N_start(Me.Handle) = 0 Then Me.FailNative()
+    End Sub
+
+    Private Sub RequireOpen()
+        If Me.Handle = Nil Then Throw New InvalidArgumentException("Process is closed")
+    End Sub
+
+    Private Sub FailNative()
+        Dim message As String = N_error(Me.Handle)
+        Me.Close()
+        Throw New ProcessException(message)
+    End Sub
+
+    ''' True while running; False once exited. Poll also reaps POSIX children.
+    Public Function Poll() As Boolean
+        Me.RequireOpen()
+        Dim state As Integer = N_poll(Me.Handle)
+        If state < 0 Then Throw New ProcessException(N_error(Me.Handle))
+        Return state = 1
+    End Function
+
+    Public Property IsRunning As Boolean
+        Get
+            Return Me.Poll()
+        End Get
+    End Property
+
+    Public Property ExitCode As Integer
+        Get
+            If Me.Poll() Then Throw New InvalidArgumentException("Process is still running")
+            Return N_exit(Me.Handle)
+        End Get
+    End Property
+
+    Public Property OutputClosed As Boolean
+        Get
+            Me.RequireOpen()
+            Return N_eof(Me.Handle, 0) <> 0
+        End Get
+    End Property
+
+    Public Property ErrorClosed As Boolean
+        Get
+            Me.RequireOpen()
+            Return N_eof(Me.Handle, 1) <> 0
+        End Get
+    End Property
+
+    Private Function ReadStream(streamIndex As Integer, maxCount As Integer) As Bytes
+        Me.RequireOpen()
+        If maxCount < 1 Or maxCount > 1048576 Then Throw New InvalidArgumentException("Read size must be 1..1048576")
+        Dim buffer As Ptr = N_alloc(maxCount)
+        If buffer = Nil Then Throw New ProcessException("Cannot allocate read buffer")
+        Try
+            Dim count As Integer = N_read(Me.Handle, streamIndex, buffer, maxCount)
+            If count < 0 Then Throw New ProcessException(N_error(Me.Handle))
+            Dim data As New Bytes()
+            If count > 0 Then data.Append(buffer, count)
+            Return data
+        Finally
+            N_free(buffer)
+        End Try
+    End Function
+
+    ''' Empty bytes means no data now; OutputClosed distinguishes observed EOF.
+    Public Function ReadOutput(maxCount As Integer = 65536) As Bytes
+        Return Me.ReadStream(0, maxCount)
+    End Function
+
+    Public Function ReadError(maxCount As Integer = 65536) As Bytes
+        Return Me.ReadStream(1, maxCount)
+    End Function
+
+    ''' Returns bytes accepted, possibly zero. Retry the remainder after draining output.
+    Public Function WriteInput(data As Bytes, offset As Integer = 0) As Integer
+        Me.RequireOpen()
+        If data = Nil Then Throw New InvalidArgumentException("Input bytes are required")
+        If offset < 0 Or offset > data.Count Then Throw New InvalidArgumentException("Invalid input byte offset")
+        If offset = data.Count Then Return 0
+        Dim accepted As Integer = N_write(Me.Handle, data.DataPtr(), data.Count, offset)
+        If accepted < 0 Then Throw New ProcessException(N_error(Me.Handle))
+        Return accepted
+    End Function
+
+    Public Sub CloseInput()
+        Me.RequireOpen()
+        N_close_input(Me.Handle)
+    End Sub
+
+    ''' Force-terminates the direct child; Poll observes its completion.
+    Public Sub Terminate()
+        Me.RequireOpen()
+        If N_terminate(Me.Handle) = 0 Then Throw New ProcessException(N_error(Me.Handle))
+    End Sub
+
+    ''' Kill the opted-in process group/job, including descendants after parent exit.
+    Public Sub TerminateTree()
+        Me.RequireOpen()
+        If N_terminate_tree(Me.Handle) = 0 Then Throw New ProcessException(N_error(Me.Handle))
+    End Sub
+
+    Public Property TerminationSignal As Integer
+        Get
+            Me.RequireOpen()
+            Return N_signal(Me.Handle)
+        End Get
+    End Property
+
+    ''' Idempotent. Terminates and waits for a still-running direct child, then frees pipes.
+    Public Sub Close()
+        If Me.Handle <> Nil Then N_delete(Me.Handle)
+        Me.Handle = Nil
+    End Sub
+
+    Public Sub Destructor()
+        Me.Close()
+    End Sub
+End Class
