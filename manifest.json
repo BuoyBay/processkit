@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "processkit",
   "version": "0.1.0",
-  "description": "Child processes with separate nonblocking pipes",
+  "description": "Child processes with pipes",
   "libraries": [
     {
       "libName": "buoy_processkit",

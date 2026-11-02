@@ -1,4 +1,4 @@
-# Child processes with separate nonblocking pipes
+# Child processes with pipes
 
 Shell-free subprocess pipes for IDE build tasks, test runners and language-server
 clients. Unlike the built-in `Shell`, this package passes an argument array directly to
