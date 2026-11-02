@@ -22,7 +22,7 @@ python3 tools/build_processkit.py --target x86_64-windows --cc x86_64-w64-mingw3
 ```
 
 The Windows ARM64 slice is cross-built with Zig 0.14.1, the same toolchain as
-compressionkit's ARM64 DLL. Delete the `.pdb` that Zig writes beside the DLL; it is not shipped:
+compressionkit's ARM64 DLL. Exclude the `.pdb` debug file from the runtime distribution:
 
 ```sh
 python3 tools/build_processkit.py --target arm64-windows --native-only \
@@ -146,7 +146,6 @@ matching slices and their import libraries, leaving old artifacts untouched.
 Collect those receipts along with native slices before multi-target sealing.
 The generic developer-tool builder uses the same receipt-aware sealer.
 
-
 ## Read-only process inspection
 
 `Import processkit` also exposes `CurrentProcessId()`, `RunningProcessIds()`, `ReadRunningProcess(processId)` and `ReadCurrentProcessUsage()`. Check `ProcessInspectionSupported()` before inspection: Linux/glibc and Windows x64/ARM64 are implemented; macOS currently exposes only the current PID and reports inspection unsupported.
@@ -154,12 +153,6 @@ The generic developer-tool builder uses the same receipt-aware sealer.
 `RunningProcessInfo` and `ProcessUsageSnapshot` are owned read-only snapshots. Enumeration does not grant process ownership or termination rights. IDs can exit or be reused immediately; snapshots are not atomic across calls. `ReadRunningProcess` returns `None` for an absent/exited PID; optional executable paths, creation times and other fields remain `None` when unavailable or denied. Failure to enumerate or read the essential Linux stat record remains an exception. Linux accepts positive Int32 PIDs; Windows accepts 1..4294967295 and omits the special idle PID zero. Invalid PID bounds throw.
 
 CPU fields are cumulative user/kernel **seconds**, not utilization percentages. `ResidentBytes` reports current RSS/working set, not peak memory; overflow is rejected. Linux uses `/proc` in the caller’s PID/mount namespace and glibc clock/page units; `StartTime` and `HandleCount` are currently `None`. Windows uses Toolhelp32 snapshots, limited-query process handles, native creation time in UTC, and current working-set/handle counters. Handles are closed internally; no handles escape.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-
-Validation receipt: inspection-native.json. The Windows owned-child fixture uses the OS PowerShell executable; the Linux fixture uses a Buoy child. The first Windows Buoy-child fixture timed out waiting for its flushed output; this observation has not been reduced or attributed to the inspection API. No native Windows Buoy-child stdio acceptance is claimed. The decoder naming workaround encountered during implementation is recorded separately as draft BUI-019, pending independent review.
-
 
 ## Linux ARM64 bridge
 
@@ -176,14 +169,7 @@ advances short writes, and exits on zero or failed writes. It uses only
 async-signal-safe operations and preserves the scalar ABI. Strict warning flags
 and fortification remain enabled.
 
-ARM64 bridge validation records the native
-Ubuntu 24.04/GCC 13.3 build, existing native pipe and sealed `PipeProcess` tests,
-startup-error fault injection, and owned-child inspection. All five source-matched
-slices are retained by the existing filtered sealer. Validation sealed only in a
-private temporary staging root. After independent approval, the parent copied
-the exact reviewed five-slice archive to `packages/` and `dist/`; the publication
-receipt is `validation/arm64-bridge-published.json`. See the handoff for exact
-hashes, retained bytes, remaining gaps, and independent-review status.
+The ARM64 Linux bridge uses native pipe, process-inspection and owned-child primitives. Collect source-matched runtime slices before sealing a multi-target package.
 
 ## Windows ARM64 slice
 
@@ -192,10 +178,12 @@ hashes, retained bytes, remaining gaps, and independent-review status.
 current `bridge.c` with Zig `aarch64-windows-gnu` (command above) and sealed
 with the other five slices. The build is warning-free under `-Wall -Wextra -Werror`.
 The DLL exports the same 19 `bpk_*` symbols as the x64 slice. It imports only
-`KERNEL32.dll` and the in-box UCRT `api-ms-win-crt-*` API sets. Consumers such as
-`tests/processkit_test.bui` and Studio's `StudioLanguageServer.bui` now link for
-`--target arm64-windows`.
+`KERNEL32.dll` and the in-box UCRT `api-ms-win-crt-*` API sets. The slice supports linking consumers with `--target arm64-windows`.
 
 The slice is **not yet executed on Windows ARM64**: no ARM64 Windows host was
 available. Pipe, owned-tree and inspection behaviour there is unverified. See
 Windows ARM64 slice validation.
+
+Builder context: run shared `tools/` commands from the assembled
+[BuoyBay workspace](https://github.com/BuoyBay/workspace-tools). The scripts live
+in [devtools](https://github.com/BuoyBay/devtools), alongside the shared build inputs.

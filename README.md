@@ -1,7 +1,7 @@
 # Run child processes with separate nonblocking pipes
 
 Shell-free subprocess pipes for IDE build tasks, test runners and language-server
-clients. Unlike Buoy's `Shell`, this package passes an argument array directly to
+clients. Unlike the built-in `Shell`, this package passes an argument array directly to
 a native executable and keeps stdout and stderr separate. It never invokes a
 command interpreter as a fallback.
 
@@ -70,8 +70,6 @@ On your own machine, install Buoy and run:
 ```sh
 buoy ai init --both
 ```
-
-The generated agent files and editor settings stay local and are ignored by Git.
 
 ## Contributing
 
