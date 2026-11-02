@@ -2,6 +2,12 @@
   "schema": 1,
   "name": "processkit",
   "version": "0.1.0",
-  "description": "Shell-free child processes with separate nonblocking stdin, stdout and stderr pipes for IDE builds and language servers",
-  "libraries": [{"libName": "buoy_processkit", "system": false, "minVersion": "0.1.0"}]
+  "description": "Child processes with separate nonblocking pipes",
+  "libraries": [
+    {
+      "libName": "buoy_processkit",
+      "system": false,
+      "minVersion": "0.1.0"
+    }
+  ]
 }
